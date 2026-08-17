@@ -80,7 +80,7 @@ def extract_frames_and_labels(record, raw_dir, out_dir, fps):
     step = max(1, round(native_fps / fps))
     sample_indices = list(range(0, total_frames, step))
 
-    fake_segments = record.get("fake_segments", [])  # list of [start_sec, end_sec]
+    fake_segments = record.get("fake_periods", [])  # list of [start_sec, end_sec]
 
     rows = []
     for i, frame_idx in enumerate(sample_indices):
