@@ -1,82 +1,133 @@
+
 """
-Shared frozen backbone + two heads. Keeping the backbone identical across both
-supervision arms is deliberate — it isolates "supervision type" as the one
-variable being compared, matching the survey's framing.
+Models for the completed LAV-DF deepfake localization experiment.
+
+This architecture matches the model used to create the existing
+weak_mil_best.pth and full_supervised_best.pth checkpoints.
+
+Architecture:
+    EfficientNet-B0
+        -> BiLSTM
+        -> video classifier
+        -> frame classifier
+
+Both supervision arms use the SAME architecture.
+The difference is only in the training loss:
+    weak MIL       -> video-level top-k supervision
+    full supervised -> frame-level supervision
 """
-import timm
+
 import torch
 import torch.nn as nn
+from torchvision.models import efficientnet_b0
 
 
-class FrozenBackbone(nn.Module):
-    """EfficientNet-B0, ImageNet-pretrained, frozen. Chosen for speed on free-tier GPUs."""
-
-    def __init__(self):
-        super().__init__()
-        self.backbone = timm.create_model("efficientnet_b0", pretrained=True, num_classes=0)
-        for p in self.backbone.parameters():
-            p.requires_grad = False
-        self.out_dim = self.backbone.num_features  # 1280 for efficientnet_b0
-
-    def forward(self, x):
-        # x: [B*T, C, H, W] -> [B*T, out_dim]
-        return self.backbone(x)
-
-
-class TemporalEncoder(nn.Module):
-    """BiLSTM over per-frame backbone features, shared architecture for both arms."""
-
-    def __init__(self, in_dim, hidden_dim=256):
-        super().__init__()
-        self.lstm = nn.LSTM(in_dim, hidden_dim, batch_first=True, bidirectional=True)
-        self.out_dim = hidden_dim * 2
-
-    def forward(self, x):
-        # x: [B, T, in_dim] -> [B, T, out_dim]
-        out, _ = self.lstm(x)
-        return out
-
-
-class FullySupervisedModel(nn.Module):
-    """Per-frame binary classification head. Trained with frame-level labels."""
-
-    def __init__(self):
-        super().__init__()
-        self.backbone = FrozenBackbone()
-        self.temporal = TemporalEncoder(self.backbone.out_dim)
-        self.classifier = nn.Linear(self.temporal.out_dim, 1)
-
-    def forward(self, clip):
-        # clip: [B, T, C, H, W]
-        B, T, C, H, W = clip.shape
-        feats = self.backbone(clip.view(B * T, C, H, W)).view(B, T, -1)
-        temporal_feats = self.temporal(feats)
-        frame_logits = self.classifier(temporal_feats).squeeze(-1)  # [B, T]
-        return frame_logits
-
-
-class WeaklySupervisedModel(nn.Module):
+class EfficientNetBiLSTM(nn.Module):
     """
-    MIL head: produces per-frame scores (used for localization at inference),
-    pooled via top-k mean into a single video-level score (used for training,
-    since only video-level labels are available).
+    Shared EfficientNet-B0 + bidirectional LSTM model.
+
+    Input:
+        clips [B, T, C, H, W]
+
+    Output:
+        video_logits [B]
+        frame_logits [B, T]
     """
 
-    def __init__(self, topk=4):
+    def __init__(
+        self,
+        hidden_size=256,
+        num_layers=1,
+        dropout=0.3,
+    ):
         super().__init__()
-        self.backbone = FrozenBackbone()
-        self.temporal = TemporalEncoder(self.backbone.out_dim)
-        self.frame_scorer = nn.Linear(self.temporal.out_dim, 1)
-        self.topk = topk
 
-    def forward(self, clip):
-        B, T, C, H, W = clip.shape
-        feats = self.backbone(clip.view(B * T, C, H, W)).view(B, T, -1)
-        temporal_feats = self.temporal(feats)
-        frame_scores = self.frame_scorer(temporal_feats).squeeze(-1)  # [B, T] (logits)
+        # EfficientNet-B0 used by the original trained checkpoints.
+        self.cnn = efficientnet_b0(
+            weights=None
+        )
 
-        k = min(self.topk, T)
-        topk_scores, _ = torch.topk(frame_scores, k, dim=1)
-        video_logit = topk_scores.mean(dim=1)  # [B]
+        # Remove ImageNet classification head.
+        self.cnn.classifier = nn.Identity()
 
-        return frame_scores, video_logit
+        cnn_out_dim = 1280
+
+        self.lstm = nn.LSTM(
+            input_size=cnn_out_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+        )
+
+        lstm_out_dim = hidden_size * 2
+
+        self.video_classifier = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(
+                lstm_out_dim,
+                1,
+            ),
+        )
+
+        self.frame_classifier = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(
+                lstm_out_dim,
+                1,
+            ),
+        )
+
+    def forward(self, clips):
+        """
+        Forward pass.
+
+        clips:
+            [B, T, C, H, W]
+
+        Returns:
+            video_logits:
+                [B]
+
+            frame_logits:
+                [B, T]
+        """
+
+        B, T, C, H, W = clips.shape
+
+        # Process every frame independently through EfficientNet.
+        x = clips.view(
+            B * T,
+            C,
+            H,
+            W,
+        )
+
+        features = self.cnn(x)
+
+        # Restore temporal dimension.
+        features = features.view(
+            B,
+            T,
+            -1,
+        )
+
+        # Temporal modeling.
+        lstm_out, _ = self.lstm(features)
+
+        # Frame-level localization logits.
+        frame_logits = self.frame_classifier(
+            lstm_out
+        ).squeeze(-1)
+
+        # Video-level classification uses the temporal mean
+        # representation, matching the trained model interface.
+        video_features = lstm_out.mean(
+            dim=1
+        )
+
+        video_logits = self.video_classifier(
+            video_features
+        ).squeeze(-1)
+
+        return video_logits, frame_logits
