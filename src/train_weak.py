@@ -1,12 +1,18 @@
-"""
-Phase 2a: train the weakly-supervised (video-level labels only) model via MIL.
 
-Loss is computed on the VIDEO-level pooled score only — frame-level labels are
-never used here, by design. Frame-level scores are only produced for later
-localization at inference time.
-
-Auto-resumes from the latest checkpoint in --ckpt_dir if one exists.
 """
+Weakly-supervised training for LAV-DF.
+
+Training signal:
+    video-level labels only.
+
+The model produces frame-level logits, but the training loss is computed
+only after MIL top-k pooling:
+
+    frame logits -> top-k -> mean -> video logit -> BCE loss
+
+Frame-level labels are intentionally NOT used during weak training.
+"""
+
 import argparse
 import os
 
@@ -16,80 +22,367 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset import VideoClipDataset
-from models import WeaklySupervisedModel
+from models import EfficientNetBiLSTM
 
-CKPT_NAME = "weak_model.pt"
+
+WEAK_BEST_NAME = "weak_mil_best.pth"
+WEAK_LAST_NAME = "weak_mil_last.pth"
+
+
+def mil_video_logit(frame_logits, k=4):
+    """
+    Convert frame-level logits [B,T] into video-level logits [B]
+    using top-k mean pooling.
+    """
+    k = min(k, frame_logits.shape[1])
+
+    topk_logits, _ = torch.topk(
+        frame_logits,
+        k=k,
+        dim=1,
+    )
+
+    return topk_logits.mean(dim=1)
 
 
 def main():
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", required=True)
-    parser.add_argument("--ckpt_dir", required=True)
-    parser.add_argument("--epochs", type=int, default=15)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--topk", type=int, default=4)
+
+    parser.add_argument(
+        "--data_dir",
+        required=True,
+    )
+
+    parser.add_argument(
+        "--ckpt_dir",
+        required=True,
+    )
+
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=5,
+    )
+
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=4,
+    )
+
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=1e-4,
+    )
+
+    parser.add_argument(
+        "--topk",
+        type=int,
+        default=4,
+    )
+
     args = parser.parse_args()
 
-    os.makedirs(args.ckpt_dir, exist_ok=True)
-    labels_csv = os.path.join(args.data_dir, "labels.csv")
-    ckpt_path = os.path.join(args.ckpt_dir, CKPT_NAME)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    train_ds = VideoClipDataset(labels_csv, split="train", mode="weak")
-    val_ds = VideoClipDataset(labels_csv, split="val", mode="weak")
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=2)
-
-    model = WeaklySupervisedModel(topk=args.topk).to(device)
-    optimizer = torch.optim.Adam(
-        [p for p in model.parameters() if p.requires_grad], lr=args.lr
+    os.makedirs(
+        args.ckpt_dir,
+        exist_ok=True,
     )
+
+    labels_csv = os.path.join(
+        args.data_dir,
+        "labels.csv",
+    )
+
+    weak_best_path = os.path.join(
+        args.ckpt_dir,
+        WEAK_BEST_NAME,
+    )
+
+    weak_last_path = os.path.join(
+        args.ckpt_dir,
+        WEAK_LAST_NAME,
+    )
+
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+
+    print("Using device:", device)
+
+    # ------------------------------------------------------------
+    # DATA
+    # ------------------------------------------------------------
+
+    train_ds = VideoClipDataset(
+        labels_csv,
+        split="train",
+        mode="weak",
+    )
+
+    dev_ds = VideoClipDataset(
+        labels_csv,
+        split="dev",
+        mode="weak",
+    )
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    dev_loader = DataLoader(
+        dev_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    # ------------------------------------------------------------
+    # MODEL
+    # ------------------------------------------------------------
+
+    model = EfficientNetBiLSTM(
+        hidden_size=256,
+        num_layers=1,
+        dropout=0.3,
+    ).to(device)
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=args.lr,
+    )
+
     criterion = nn.BCEWithLogitsLoss()
 
+    best_val_loss = float("inf")
     start_epoch = 0
-    if os.path.exists(ckpt_path):
-        print(f"Resuming from {ckpt_path}")
-        ckpt = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(ckpt["model_state"])
-        optimizer.load_state_dict(ckpt["optimizer_state"])
-        start_epoch = ckpt["epoch"] + 1
 
-    for epoch in range(start_epoch, args.epochs):
+    # ------------------------------------------------------------
+    # RESUME
+    # ------------------------------------------------------------
+
+    if os.path.exists(weak_last_path):
+
+        print(
+            "Existing weak checkpoint found:"
+        )
+        print(weak_last_path)
+
+        checkpoint = torch.load(
+            weak_last_path,
+            map_location=device,
+        )
+
+        model.load_state_dict(
+            checkpoint["model_state_dict"],
+            strict=True,
+        )
+
+        optimizer.load_state_dict(
+            checkpoint["optimizer_state_dict"]
+        )
+
+        start_epoch = (
+            checkpoint["epoch"] + 1
+        )
+
+        best_val_loss = checkpoint[
+            "best_val_loss"
+        ]
+
+        print(
+            "Resuming from epoch:",
+            start_epoch,
+        )
+
+    # ------------------------------------------------------------
+    # TRAINING
+    # ------------------------------------------------------------
+
+    for epoch in range(
+        start_epoch,
+        args.epochs,
+    ):
+
         model.train()
-        total_loss = 0.0
-        for clip, video_label in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [train]"):
-            clip, video_label = clip.to(device), video_label.to(device)
+
+        train_loss = 0.0
+
+        progress = tqdm(
+            train_loader,
+            desc=(
+                f"Epoch {epoch + 1}/"
+                f"{args.epochs} - Train"
+            ),
+        )
+
+        for (
+            clips,
+            video_labels,
+        ) in progress:
+
+            clips = clips.to(
+                device,
+                non_blocking=True,
+            )
+
+            video_labels = video_labels.to(
+                device,
+                non_blocking=True,
+            )
+
             optimizer.zero_grad()
-            _, video_logit = model(clip)
-            loss = criterion(video_logit, video_label)
+
+            # Model output:
+            # video_logits [B], frame_logits [B,T]
+            _, frame_logits = model(
+                clips
+            )
+
+            # MIL top-k pooling.
+            video_logits = mil_video_logit(
+                frame_logits,
+                k=args.topk,
+            )
+
+            # IMPORTANT:
+            # Weak training uses ONLY video labels.
+            loss = criterion(
+                video_logits,
+                video_labels,
+            )
+
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()
 
-        avg_train_loss = total_loss / len(train_loader)
+            train_loss += loss.item()
+
+            progress.set_postfix(
+                loss=loss.item()
+            )
+
+        train_loss /= len(
+            train_loader
+        )
+
+        # --------------------------------------------------------
+        # VALIDATION
+        # --------------------------------------------------------
 
         model.eval()
+
         val_loss = 0.0
+
         with torch.no_grad():
-            for clip, video_label in val_loader:
-                clip, video_label = clip.to(device), video_label.to(device)
-                _, video_logit = model(clip)
-                val_loss += criterion(video_logit, video_label).item()
-        avg_val_loss = val_loss / len(val_loader)
 
-        print(f"Epoch {epoch+1}: train_loss={avg_train_loss:.4f} val_loss={avg_val_loss:.4f}")
+            for (
+                clips,
+                video_labels,
+            ) in dev_loader:
 
-        torch.save({
-            "epoch": epoch,
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "val_loss": avg_val_loss,
-        }, ckpt_path)
+                clips = clips.to(
+                    device,
+                    non_blocking=True,
+                )
 
-    print(f"Training complete. Final checkpoint at {ckpt_path}")
+                video_labels = video_labels.to(
+                    device,
+                    non_blocking=True,
+                )
+
+                _, frame_logits = model(
+                    clips
+                )
+
+                video_logits = mil_video_logit(
+                    frame_logits,
+                    k=args.topk,
+                )
+
+                loss = criterion(
+                    video_logits,
+                    video_labels,
+                )
+
+                val_loss += loss.item()
+
+        val_loss /= len(
+            dev_loader
+        )
+
+        print(
+            f"\nEpoch {epoch + 1}: "
+            f"train_loss={train_loss:.4f}, "
+            f"val_loss={val_loss:.4f}"
+        )
+
+        # --------------------------------------------------------
+        # SAVE LAST
+        # --------------------------------------------------------
+
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state_dict":
+                    model.state_dict(),
+                "optimizer_state_dict":
+                    optimizer.state_dict(),
+                "train_loss":
+                    train_loss,
+                "val_loss":
+                    val_loss,
+                "best_val_loss":
+                    best_val_loss,
+                "k":
+                    args.topk,
+            },
+            weak_last_path,
+        )
+
+        # --------------------------------------------------------
+        # SAVE BEST
+        # --------------------------------------------------------
+
+        if val_loss < best_val_loss:
+
+            best_val_loss = val_loss
+
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict":
+                        model.state_dict(),
+                    "val_loss":
+                        val_loss,
+                    "k":
+                        args.topk,
+                },
+                weak_best_path,
+            )
+
+            print(
+                "✅ New best weak MIL model saved."
+            )
+
+    print("\n==============================")
+    print("WEAK MIL TRAINING COMPLETE")
+    print("==============================")
+    print(
+        "Best checkpoint:",
+        weak_best_path,
+    )
+    print(
+        "Last checkpoint:",
+        weak_last_path,
+    )
 
 
 if __name__ == "__main__":
